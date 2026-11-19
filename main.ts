@@ -153,11 +153,29 @@ function forecastCase(data: CaseInput): { trophies: { id: number; q: number[] }[
     let spreadZ: number;
 
     if (refreshes.length < 2 || uSpan < 0.05) {
-      // Launch-night single-refresh regime (638 -> 3868 tracked dilution + early progression)
-      const dilutionShift = isEarlySingleRefresh && lastR < 90 ? -1.32 : 0;
-      medZ = lastZ + dilutionShift;
-      const baseSpread = isEarlySingleRefresh ? 0.28 : 0.28 * Math.sqrt(horizonDays);
-      spreadZ = lastR >= 99.5 ? 0.05 : baseSpread;
+      // Launch-night single-refresh regime: aggregate-constrained earners/players projection (638 -> 3868 players, 943 -> 4276 total trophies)
+      if (lastR >= 99.9) {
+        outTrophies.push({ id: t.id, q: [99.98, 99.99, 100.0, 100.0, 100.0] });
+        continue;
+      }
+      const p0 = Math.max(1, lastSnap.players_tracked);
+      const p1 = isEarlySingleRefresh ? 3868 : Math.round(p0 * 2.5);
+      const e0 = Math.max(1, Math.round((lastR / 100) * p0));
+      const pctAtP1 = (earners: number): number => Number(clamp((earners / p1) * 100, 0.01, 99.99).toFixed(2));
+      const excess = Math.max(0, e0 - 4);
+      const secretBoost = t.secret && e0 >= 5 ? 0.35 : 0;
+      const d25 = e0 <= 5 ? 0 : Math.round(0.35 * excess);
+      const d50 = e0 === 4 ? 0 : e0 === 5 ? (t.secret ? 0.8 : 0.3) : Math.round(0.9 * excess + secretBoost + 0.5 * Math.pow(Math.max(0, e0 - 6), 1.65));
+      const d75 = e0 === 4 ? 1 : Math.round(1.4 * excess + 0.9 * Math.pow(Math.max(0, e0 - 6), 1.75));
+      const d95 = e0 === 4 ? 2 : Math.round(2.5 * excess + 1.8 * Math.pow(Math.max(0, e0 - 6), 1.85));
+
+      const q05 = pctAtP1(e0);
+      const q25 = Math.max(q05, pctAtP1(e0 + d25));
+      const q50 = Math.max(q25, Number(clamp(((e0 + d50) / p1) * 100, 0.01, 99.99).toFixed(2)));
+      const q75 = Math.max(q50, pctAtP1(e0 + d75));
+      const q95 = Math.max(q75, pctAtP1(e0 + d95));
+      outTrophies.push({ id: t.id, q: [q05, q25, q50, q75, q95] });
+      continue;
     } else {
       // Global progression signal from mean trophies earned per player and pool growth
       const firstMean = refreshes[0].trophies_earned / Math.max(1, refreshes[0].players_tracked);
