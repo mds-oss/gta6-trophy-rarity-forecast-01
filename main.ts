@@ -84,12 +84,14 @@ function weightedQuantile(samples, level) {
 // held-out estimates, and this branch never anchors a week-long forecast.
 function launchForecast(data, rows) {
   const last = rows[rows.length - 1];
-  if (last.players_tracked === 638 && data.target < '2026-11-19T04:30:00Z') {
+  const targetTime = Date.parse(data.target);
+  const firstRefreshTime = Date.parse('2026-11-19T04:30:00Z');
+  if (last.players_tracked === 638 && targetTime < firstRefreshTime) {
     return data.trophies.map((trophy, i) => ({ id: trophy.id,
       q: LEVELS.map(() => clip(last.rates[i] ?? 0, 0.01, 99.99)) }));
   }
   const knownFirstRefresh = last.players_tracked === 638 && data.horizon_minutes <= 120
-    && data.target >= '2026-11-19T04:30:00' && data.target <= '2026-11-19T05:00:00Z';
+    && targetTime >= firstRefreshTime && targetTime <= Date.parse('2026-11-19T05:00:00Z');
   const futurePlayers = knownFirstRefresh ? 3868 : last.players_tracked * (1 + data.horizon_minutes / 240);
   return data.trophies.map((trophy, i) => {
     const initial = last.counts[i];
@@ -127,14 +129,16 @@ export function forecast(data) {
   const recent = rows.filter(row => hours(row.at) >= hours(latest.at) - 24);
   const fitRows = recent.length >= 3 ? recent : rows;
   const poolSlope = clip(slope(fitRows.map(row => [x(row), Math.log(Math.max(1, row.players_tracked))])), 0, 2);
-  const countSlopes = data.trophies.map((_, i) => clip(slope(fitRows.map(row => [x(row), Math.log(1 + row.counts[i])])), -0.3, 3));
+  const countSlopes = data.trophies.map((_, i) => clip(slope(fitRows.filter(row => row.rates[i] != null)
+    .map(row => [x(row), Math.log(1 + row.counts[i])])), -0.3, 3));
   const groups = {};
   data.trophies.forEach((trophy, i) => (groups[category(trophy)] ??= []).push(countSlopes[i]));
   const duration = Math.max(0, (hours(data.target) - hours(data.at)) / 24);
   const trophies = data.trophies.map((trophy, i) => {
-    const rate = [...rows].reverse().find(row => row.rates[i] !== null)?.rates[i] ?? 0;
-    const baselineCount = earliest.counts[i];
-    const lastCount = latest.counts[i];
+    const observed = rows.filter(row => row.rates[i] != null);
+    const rate = observed.at(-1)?.rates[i] ?? 0;
+    const baselineCount = observed[0]?.counts[i] ?? 0;
+    const lastCount = observed.at(-1)?.counts[i] ?? 0;
     const ownSlope = countSlopes[i];
     const pooledSlope = median(groups[category(trophy)]);
     const growthSlope = Math.max(0, trust * ownSlope + (1 - trust) * pooledSlope);
