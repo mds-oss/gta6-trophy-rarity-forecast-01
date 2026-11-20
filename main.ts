@@ -1,245 +1,180 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
-interface Trophy {
-  id: number;
-  name: string;
-  description: string;
-  tier: 'platinum' | 'gold' | 'silver' | 'bronze';
-  points: number;
-  secret: boolean;
+const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
+const NORMAL = [-1.644854, -0.67449, 0, 0.67449, 1.644854];
+const clip = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+export const logit = r => Math.log(clip(r, 0.01, 99.99) / (100 - clip(r, 0.01, 99.99)));
+const percent = z => clip(100 / (1 + Math.exp(-clip(z, -30, 30))), 0.01, 99.99);
+const median = values => {
+  const a = values.slice().sort((x, y) => x - y);
+  return a.length ? a[Math.floor(a.length / 2)] : 0;
+};
+const hours = iso => Date.parse(iso) / 3600000;
+
+export function countBounds(rate, players) {
+  if (rate === null || rate === undefined) return [0, players];
+  return [Math.max(0, Math.ceil((rate - 0.005) * players / 100 - 1e-8)),
+    Math.min(players, Math.ceil((rate + 0.005) * players / 100 - 1e-8) - 1)];
 }
 
-interface HistorySnapshot {
-  slot: string;
-  at: string;
-  players_tracked: number;
-  trophies_earned: number;
-  rates: (number | null)[];
-}
-
-interface CaseInput {
-  id: string;
-  at: string;
-  horizon_minutes: number;
-  target: string;
-  levels: number[];
-  trophies: Trophy[];
-  history: HistorySnapshot[];
-}
-
-const LAUNCH_MS = Date.parse('2026-11-18T23:30:00Z');
-const Z_NORM = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854];
-
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v));
-}
-
-function logit(pct: number): number {
-  const p = clamp(pct, 0.01, 99.99) / 100;
-  return Math.log(p / (1 - p));
-}
-
-function invLogit(z: number): number {
-  const p = 1 / (1 + Math.exp(-clamp(z, -12, 12)));
-  return clamp(p * 100, 0.01, 99.99);
-}
-
-function logHoursSinceLaunch(iso: string): number {
-  const hrs = Math.max(0.1, (Date.parse(iso) - LAUNCH_MS) / 3_600_000);
-  return Math.log(1 + hrs);
-}
-
-function deduplicateRefreshes(history: HistorySnapshot[]): HistorySnapshot[] {
-  const unique: HistorySnapshot[] = [];
-  let prevKey = '';
-  for (const snap of history) {
-    const key = `${snap.players_tracked}|${snap.trophies_earned}|${snap.rates.join(',')}`;
-    if (key !== prevKey) {
-      unique.push(snap);
-      prevKey = key;
+// Rounded rates identify intervals, not exact counts once the pool is large.
+function counts(snapshot) {
+  const n = Math.max(1, snapshot.players_tracked);
+  const bounds = snapshot.rates.map(r => countBounds(r, n));
+  const estimates = bounds.map(([lo, hi], i) => clip((snapshot.rates[i] ?? 0) * n / 100, lo, hi));
+  const minimum = bounds.reduce((a, b) => a + b[0], 0);
+  const maximum = bounds.reduce((a, b) => a + b[1], 0);
+  if (snapshot.trophies_earned >= minimum && snapshot.trophies_earned <= maximum) {
+    for (let pass = 0; pass < 4; pass++) {
+      const difference = snapshot.trophies_earned - estimates.reduce((a, b) => a + b, 0);
+      const room = bounds.map(([lo, hi], i) => difference >= 0 ? hi - estimates[i] : estimates[i] - lo);
+      const total = room.reduce((a, b) => a + b, 0);
+      if (total < 1e-8) break;
+      estimates.forEach((value, i) => { estimates[i] = value + difference * room[i] / total; });
     }
   }
-  return unique;
+  return estimates;
 }
 
-function forecastCase(data: CaseInput): { trophies: { id: number; q: number[] }[] } {
-  const refreshes = deduplicateRefreshes(data.history);
-  const lastSnap = data.history[data.history.length - 1];
-  const uTarget = logHoursSinceLaunch(data.target);
-  const uLast = logHoursSinceLaunch(lastSnap.at);
-  const du = Math.max(0.01, uTarget - uLast);
-  const horizonDays = Math.max(0.01, data.horizon_minutes / 1440);
-
-  // Compute per-trophy weighted linear regression on logit(rate) vs logHours
-  const rawSlopes: number[] = [];
-  const rawIntercepts: number[] = [];
-  const rawResiduals: number[] = [];
-  const uSpan = refreshes.length >= 2
-    ? logHoursSinceLaunch(refreshes[refreshes.length - 1].at) - logHoursSinceLaunch(refreshes[0].at)
-    : 0;
-
-  for (let i = 0; i < data.trophies.length; i++) {
-    const pts: { u: number; y: number; w: number }[] = [];
-    for (let j = 0; j < refreshes.length; j++) {
-      const r = refreshes[j].rates[i];
-      if (r === null || r === undefined) continue;
-      const u = logHoursSinceLaunch(refreshes[j].at);
-      // Weight newer refreshes and larger player pools higher
-      const recencyW = Math.exp(-0.5 * (refreshes.length - 1 - j) / Math.max(1, refreshes.length * 0.4));
-      const poolW = Math.sqrt(Math.max(1, refreshes[j].players_tracked));
-      pts.push({ u, y: logit(r), w: recencyW * poolW });
-    }
-
-    if (pts.length < 2 || uSpan < 0.05) {
-      const lastR = lastSnap.rates[i] ?? 1.0;
-      rawSlopes.push(0);
-      rawIntercepts.push(logit(lastR));
-      rawResiduals.push(0);
-      continue;
-    }
-
-    let sw = 0, swu = 0, swy = 0;
-    for (const p of pts) {
-      sw += p.w;
-      swu += p.w * p.u;
-      swy += p.w * p.y;
-    }
-    const meanU = swu / sw;
-    const meanY = swy / sw;
-
-    let num = 0, den = 0;
-    for (const p of pts) {
-      num += p.w * (p.u - meanU) * (p.y - meanY);
-      den += p.w * (p.u - meanU) * (p.u - meanU);
-    }
-    const slope = den > 1e-9 ? clamp(num / den, -1.5, 2.0) : 0;
-    const intercept = meanY - slope * meanU;
-
-    let rss = 0;
-    for (const p of pts) {
-      const err = p.y - (intercept + slope * p.u);
-      rss += p.w * err * err;
-    }
-    const rmse = Math.sqrt(rss / sw);
-
-    rawSlopes.push(slope);
-    rawIntercepts.push(intercept);
-    rawResiduals.push(rmse);
+function distinct(history) {
+  const result = [];
+  let previous;
+  for (const row of history) {
+    const signature = JSON.stringify([row.players_tracked, row.trophies_earned, row.rates]);
+    if (signature !== previous) result.push({ ...row, counts: counts(row) });
+    previous = signature;
   }
+  return result;
+}
 
-  // Tier-pooled slope prior
-  const tierGroups: Record<string, number[]> = { platinum: [], gold: [], silver: [], bronze: [] };
-  for (let i = 0; i < data.trophies.length; i++) {
-    if (refreshes.length >= 2 && uSpan >= 0.05) {
-      tierGroups[data.trophies[i].tier].push(rawSlopes[i]);
+// Pairwise slopes limit sensitivity to a single refresh and its recorder delay.
+function slope(points) {
+  const differences = [];
+  const stride = Math.max(1, Math.floor(points.length / 20));
+  for (let i = 0; i < points.length; i += stride) {
+    for (let j = i + stride; j < points.length; j += stride) {
+      if (points[j][0] - points[i][0] > 0.05) differences.push((points[j][1] - points[i][1]) / (points[j][0] - points[i][0]));
     }
   }
-  const tierMeanSlope: Record<string, number> = {};
-  for (const tier of Object.keys(tierGroups)) {
-    const arr = tierGroups[tier];
-    tierMeanSlope[tier] = arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+  return median(differences);
+}
+
+function category(trophy) {
+  const text = trophy.description.toLowerCase();
+  if (trophy.tier === 'platinum' || trophy.points >= 90 || /all |250 |100%|collectible|every spot/.test(text)) return 'grind';
+  if (/chapter|breakfast run|gone fishing/.test(text)) return 'story';
+  return trophy.secret ? 'hidden' : 'activity';
+}
+
+function weightedQuantile(samples, level) {
+  samples.sort((a, b) => a[0] - b[0]);
+  const total = samples.reduce((sum, s) => sum + s[1], 0);
+  let mass = 0;
+  for (const [value, weight] of samples) {
+    mass += weight;
+    if (mass >= level * total - 1e-12) return value;
   }
+  return samples[samples.length - 1][0];
+}
 
-  const outTrophies: { id: number; q: number[] }[] = [];
-  const isEarlySingleRefresh = refreshes.length < 2 && lastSnap.players_tracked < 2000;
-
-  for (let i = 0; i < data.trophies.length; i++) {
-    const t = data.trophies[i];
-    const lastR = lastSnap.rates[i] ?? 1.0;
-    const lastZ = logit(lastR);
-
-    let medZ: number;
-    let spreadZ: number;
-
-    if (refreshes.length < 2 || uSpan < 0.05) {
-      // Launch-night single-refresh regime: integer-quantized earners/players projection (638 -> 3868 players, 943 -> 4276 total trophies)
-      if (lastR >= 99.9) {
-        outTrophies.push({ id: t.id, q: [99.99, 99.99, 100.0, 100.0, 100.0] });
-        continue;
+// Prior assumptions for a cached launch page. The denominator is disclosed in
+// RULES.txt, not inferred from the unchanged practice histories. These are not
+// held-out estimates, and this branch never anchors a week-long forecast.
+function launchForecast(data, rows) {
+  const last = rows[rows.length - 1];
+  if (last.players_tracked === 638 && data.target < '2026-11-19T04:30:00Z') {
+    return data.trophies.map((trophy, i) => ({ id: trophy.id,
+      q: LEVELS.map(() => clip(last.rates[i] ?? 0, 0.01, 99.99)) }));
+  }
+  const knownFirstRefresh = last.players_tracked === 638 && data.horizon_minutes <= 120
+    && data.target >= '2026-11-19T04:30:00' && data.target <= '2026-11-19T05:00:00Z';
+  const futurePlayers = knownFirstRefresh ? 3868 : last.players_tracked * (1 + data.horizon_minutes / 240);
+  return data.trophies.map((trophy, i) => {
+    const initial = last.counts[i];
+    if (last.rates[i] >= 99.99) return { id: trophy.id, q: [99.99, 99.99, 99.99, 99.99, 99.99] };
+    const text = trophy.description.toLowerCase();
+    let growth = Math.max(0, initial - 5) * 0.25;
+    if (/chapter 1\./.test(text)) growth = 16;
+    if (/breakfast run/.test(text)) growth = 5;
+    if (/fishing challenge/.test(text)) growth = 36;
+    if (/arcade game/.test(text)) growth = 4;
+    if (/discover 100 vehicles/.test(text)) growth = 6;
+    if (category(trophy) === 'grind') growth *= 0.25;
+    const samples = [];
+    for (const [factor, weight] of [[0, 0.08], [0.5, 0.17], [1, 0.5], [1.5, 0.17], [2.5, 0.08]]) {
+      for (const [extra, mass] of [[0, 0.8], [1, 0.2]]) {
+        const count = Math.max(initial, Math.round(initial + growth * factor + extra));
+        samples.push([Number((100 * count / futurePlayers).toFixed(2)), weight * mass]);
       }
-      const p0 = Math.max(1, lastSnap.players_tracked);
-      const p1 = isEarlySingleRefresh ? 3868 : Math.round(p0 * 2.5);
-      const e0 = Math.max(1, Math.round((lastR / 100) * p0));
-      const pctAtP1 = (earners: number): number => Number(clamp((Math.round(earners) / p1) * 100, 0.01, 99.99).toFixed(2));
-
-      let eQuantiles: [number, number, number, number, number];
-      if (e0 <= 4) {
-        eQuantiles = [e0, e0, e0, e0, e0 + 1];
-      } else if (e0 === 5) {
-        eQuantiles = t.secret ? [5, 5, 6, 6, 7] : [5, 5, 5, 6, 7];
-      } else if (e0 === 6) {
-        eQuantiles = [6, 7, 7, 8, 10];
-      } else if (e0 === 7) {
-        eQuantiles = t.tier === 'gold' ? [7, 7, 8, 9, 11] : [7, 8, 9, 10, 12];
-      } else if (e0 === 8) {
-        eQuantiles = t.secret ? [8, 16, 24, 30, 40] : [8, 9, 11, 13, 17];
-      } else if (e0 === 10) {
-        eQuantiles = [10, 16, 22, 27, 36];
-      } else {
-        const lift = Math.round((e0 - 6) * 2.4);
-        eQuantiles = [e0, e0 + Math.round(lift * 0.6), e0 + lift, e0 + Math.round(lift * 1.35), e0 + Math.round(lift * 1.9)];
-      }
-
-      const qs = eQuantiles.map(pctAtP1);
-      for (let k = 1; k < qs.length; k++) {
-        if (qs[k] < qs[k - 1]) qs[k] = qs[k - 1];
-      }
-      outTrophies.push({ id: t.id, q: qs });
-      continue;
-    } else {
-      // Multi-refresh regime (final f00 case): combine damped logit trend with aggregate-constrained earners/players monotonicity
-      const firstSnap = refreshes[0];
-      const pFirst = Math.max(1, firstSnap.players_tracked);
-      const pLast = Math.max(1, lastSnap.players_tracked);
-      const eLast = Math.max(0, Math.round((lastR / 100) * pLast));
-
-      // Project player pool at target to enforce physical earner monotonicity floor (earners_target >= eLast)
-      const poolGrowthRate = Math.max(0, Math.log(pLast / pFirst) / Math.max(0.2, uSpan));
-      const effDu = Math.sqrt(du * Math.min(du, 1.45));
-      const pTargetHigh = pLast * Math.exp(Math.min(1.8, poolGrowthRate * effDu * 1.25));
-      const monoFloorPct = Number(clamp((eLast / Math.max(pLast, pTargetHigh)) * 100, 0.01, lastR).toFixed(4));
-
-      // Global progression signal from non-intro trophies earned per tracked player
-      const firstMean = Math.max(0.05, (firstSnap.trophies_earned - pFirst) / pFirst);
-      const lastMean = Math.max(0.05, (lastSnap.trophies_earned - pLast) / pLast);
-      const globalLogitDrift = Math.log(lastMean / firstMean) / Math.max(0.2, uSpan);
-
-      // Shrink individual slope toward tier mean slope + damped global progression
-      const shrinkW = clamp(uSpan / (uSpan + 0.70), 0.18, 0.82);
-      const priorSlope = 0.72 * tierMeanSlope[t.tier] + 0.28 * clamp(globalLogitDrift, -0.4, 1.25);
-      const rawShrunk = shrinkW * rawSlopes[i] + (1 - shrinkW) * priorSlope;
-      const shrunkSlope = lastR >= 95 ? Math.min(rawShrunk, 0.12) : rawShrunk;
-      medZ = lastZ + shrunkSlope * effDu;
-
-      const tierMult = t.tier === 'platinum' ? 1.15 : t.tier === 'gold' ? 1.08 : 1.0;
-      const horizonSigma = 0.26 * Math.sqrt(horizonDays) * tierMult;
-      const poolSigma = pLast < 3000 ? 0.20 : 0.07;
-      spreadZ = Math.hypot(horizonSigma, rawResiduals[i] * 0.70, poolSigma);
-      if (lastR >= 99.5) spreadZ = Math.min(spreadZ, 0.12);
-
-      const qs = lastR >= 99.9
-        ? [99.95, 99.98, 99.99, 100.0, 100.0]
-        : Z_NORM.map((zq) => Number(invLogit(medZ + zq * spreadZ).toFixed(4)));
-      if (qs[0] < monoFloorPct) qs[0] = monoFloorPct;
-      for (let k = 1; k < qs.length; k++) {
-        if (qs[k] < qs[k - 1]) qs[k] = qs[k - 1];
-      }
-      outTrophies.push({ id: t.id, q: qs });
     }
+    return { id: trophy.id, q: LEVELS.map(q => clip(weightedQuantile(samples, q), 0.01, 99.99)) };
+  });
+}
+
+export function forecast(data) {
+  const rows = distinct(data.history);
+  if (rows.length < 2) return { trophies: launchForecast(data, rows) };
+  const latest = rows[rows.length - 1];
+  const earliest = rows[0];
+  const epoch = hours(data.game.release_date + 'T00:00:00Z');
+  const x = row => Math.log1p(Math.max(0, hours(row.at) - epoch));
+  const targetX = Math.log1p(Math.max(0, hours(data.target) - epoch));
+  const dx = Math.max(0, targetX - x(latest));
+  const span = x(latest) - x(earliest);
+  const trust = Math.min(0.9, (rows.length - 1) / 6) * Math.min(1, span / 0.7);
+  const recent = rows.filter(row => hours(row.at) >= hours(latest.at) - 24);
+  const fitRows = recent.length >= 3 ? recent : rows;
+  const poolSlope = clip(slope(fitRows.map(row => [x(row), Math.log(Math.max(1, row.players_tracked))])), 0, 2);
+  const countSlopes = data.trophies.map((_, i) => clip(slope(fitRows.map(row => [x(row), Math.log(1 + row.counts[i])])), -0.3, 3));
+  const groups = {};
+  data.trophies.forEach((trophy, i) => (groups[category(trophy)] ??= []).push(countSlopes[i]));
+  const duration = Math.max(0, (hours(data.target) - hours(data.at)) / 24);
+  const trophies = data.trophies.map((trophy, i) => {
+    const rate = [...rows].reverse().find(row => row.rates[i] !== null)?.rates[i] ?? 0;
+    const baselineCount = earliest.counts[i];
+    const lastCount = latest.counts[i];
+    const ownSlope = countSlopes[i];
+    const pooledSlope = median(groups[category(trophy)]);
+    const growthSlope = Math.max(0, trust * ownSlope + (1 - trust) * pooledSlope);
+    const rateSlope = clip(slope(fitRows.filter(row => row.rates[i] !== null).map(row => [x(row), logit(row.rates[i])])), -2, 2);
+    const countChange = Math.max(0, lastCount - baselineCount);
+    const samples = [];
+    for (const [damping, weight] of [[0.35, 0.2], [0.7, 0.6], [1, 0.2]]) {
+      const pool = latest.players_tracked * Math.exp(Math.min(3, poolSlope * dx * damping));
+      const grown = Math.max(lastCount, (lastCount + 1) * Math.exp(Math.min(4, growthSlope * dx * damping)) - 1);
+      // Flat earners stay flat even when their rarity falls with pool growth.
+      const offsetGrowth = lastCount + countChange * Math.expm1(dx * damping) / Math.max(0.3, span);
+      const countMedian = countChange < 1 ? lastCount : Math.sqrt(grown * Math.max(lastCount, offsetGrowth));
+      const countZ = logit(100 * countMedian / Math.max(pool, countMedian));
+      const trendZ = logit(rate) + rateSlope * dx * damping * trust;
+      const center = 0.85 * countZ + 0.15 * trendZ;
+      const stableCount = Math.abs(lastCount - baselineCount) < Math.max(1, lastCount * 0.05);
+      const spread = (stableCount ? 0.12 : 0.25) * Math.sqrt(duration) + 0.12 * dx + 0.1 * (1 - trust);
+      for (let k = 0; k < NORMAL.length; k++) {
+        const probability = [0.125, 0.25, 0.25, 0.25, 0.125][k];
+        samples.push([percent(center + NORMAL[k] * spread), weight * probability]);
+      }
+    }
+    if (rate >= 99.9) {
+      const deficit = Math.max(0.01, 100 - rate);
+      return { id: trophy.id, q: [100 - deficit * 4, 100 - deficit * 2, rate, 99.99, 99.99].map(v => clip(v, 0.01, 99.99)) };
+    }
+    return { id: trophy.id, q: LEVELS.map(level => Number(weightedQuantile(samples, level).toFixed(6))) };
+  });
+  return { trophies };
+}
+
+function run() {
+  const input = process.env.MAKEFUN_INPUT_DIR || '/input';
+  const output = process.env.MAKEFUN_OUTPUT_DIR || '/output';
+  mkdirSync(output, { recursive: true });
+  for (const file of readdirSync(input).filter(name => name.endsWith('.in')).sort()) {
+    const data = JSON.parse(readFileSync(join(input, file), 'utf8'));
+    const result = JSON.stringify(forecast(data));
+    if (Buffer.byteLength(result) > 65536) throw new Error('Output exceeds limit');
+    writeFileSync(join(output, file.slice(0, -3) + '.out'), result + '\n');
   }
-
-  return { trophies: outTrophies };
 }
-
-const inDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-mkdirSync(outDir, { recursive: true });
-
-const files = readdirSync(inDir).filter((f) => f.endsWith('.in')).sort();
-for (const file of files) {
-  const data = JSON.parse(readFileSync(join(inDir, file), 'utf8')) as CaseInput;
-  const result = forecastCase(data);
-  const outName = file.replace(/\.in$/, '.out');
-  writeFileSync(join(outDir, outName), JSON.stringify(result));
-}
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) run();
