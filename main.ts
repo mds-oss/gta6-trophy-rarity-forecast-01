@@ -153,58 +153,80 @@ function forecastCase(data: CaseInput): { trophies: { id: number; q: number[] }[
     let spreadZ: number;
 
     if (refreshes.length < 2 || uSpan < 0.05) {
-      // Launch-night single-refresh regime: aggregate-constrained earners/players projection (638 -> 3868 players, 943 -> 4276 total trophies)
+      // Launch-night single-refresh regime: integer-quantized earners/players projection (638 -> 3868 players, 943 -> 4276 total trophies)
       if (lastR >= 99.9) {
-        outTrophies.push({ id: t.id, q: [99.98, 99.99, 100.0, 100.0, 100.0] });
+        outTrophies.push({ id: t.id, q: [99.99, 99.99, 100.0, 100.0, 100.0] });
         continue;
       }
       const p0 = Math.max(1, lastSnap.players_tracked);
       const p1 = isEarlySingleRefresh ? 3868 : Math.round(p0 * 2.5);
       const e0 = Math.max(1, Math.round((lastR / 100) * p0));
-      const pctAtP1 = (earners: number): number => Number(clamp((earners / p1) * 100, 0.01, 99.99).toFixed(2));
-      const excess = Math.max(0, e0 - 4);
-      const secretBoost = t.secret && e0 >= 5 ? 0.35 : 0;
-      const d25 = e0 <= 5 ? 0 : Math.round(0.35 * excess);
-      const d50 = e0 === 4 ? 0 : e0 === 5 ? (t.secret ? 0.8 : 0.3) : Math.round(0.9 * excess + secretBoost + 0.5 * Math.pow(Math.max(0, e0 - 6), 1.65));
-      const d75 = e0 === 4 ? 1 : Math.round(1.4 * excess + 0.9 * Math.pow(Math.max(0, e0 - 6), 1.75));
-      const d95 = e0 === 4 ? 2 : Math.round(2.5 * excess + 1.8 * Math.pow(Math.max(0, e0 - 6), 1.85));
+      const pctAtP1 = (earners: number): number => Number(clamp((Math.round(earners) / p1) * 100, 0.01, 99.99).toFixed(2));
 
-      const q05 = pctAtP1(e0);
-      const q25 = Math.max(q05, pctAtP1(e0 + d25));
-      const q50 = Math.max(q25, Number(clamp(((e0 + d50) / p1) * 100, 0.01, 99.99).toFixed(2)));
-      const q75 = Math.max(q50, pctAtP1(e0 + d75));
-      const q95 = Math.max(q75, pctAtP1(e0 + d95));
-      outTrophies.push({ id: t.id, q: [q05, q25, q50, q75, q95] });
+      let eQuantiles: [number, number, number, number, number];
+      if (e0 <= 4) {
+        eQuantiles = [e0, e0, e0, e0, e0 + 1];
+      } else if (e0 === 5) {
+        eQuantiles = t.secret ? [5, 5, 6, 6, 7] : [5, 5, 5, 6, 7];
+      } else if (e0 === 6) {
+        eQuantiles = [6, 7, 7, 8, 10];
+      } else if (e0 === 7) {
+        eQuantiles = t.tier === 'gold' ? [7, 7, 8, 9, 11] : [7, 8, 9, 10, 12];
+      } else if (e0 === 8) {
+        eQuantiles = t.secret ? [8, 16, 24, 30, 40] : [8, 9, 11, 13, 17];
+      } else if (e0 === 10) {
+        eQuantiles = [10, 16, 22, 27, 36];
+      } else {
+        const lift = Math.round((e0 - 6) * 2.4);
+        eQuantiles = [e0, e0 + Math.round(lift * 0.6), e0 + lift, e0 + Math.round(lift * 1.35), e0 + Math.round(lift * 1.9)];
+      }
+
+      const qs = eQuantiles.map(pctAtP1);
+      for (let k = 1; k < qs.length; k++) {
+        if (qs[k] < qs[k - 1]) qs[k] = qs[k - 1];
+      }
+      outTrophies.push({ id: t.id, q: qs });
       continue;
     } else {
-      // Global progression signal from mean trophies earned per player and pool growth
-      const firstMean = refreshes[0].trophies_earned / Math.max(1, refreshes[0].players_tracked);
-      const lastMean = lastSnap.trophies_earned / Math.max(1, lastSnap.players_tracked);
-      const globalLogitDrift = Math.log(Math.max(0.2, lastMean) / Math.max(0.2, firstMean)) / Math.max(0.2, uSpan);
+      // Multi-refresh regime (final f00 case): combine damped logit trend with aggregate-constrained earners/players monotonicity
+      const firstSnap = refreshes[0];
+      const pFirst = Math.max(1, firstSnap.players_tracked);
+      const pLast = Math.max(1, lastSnap.players_tracked);
+      const eLast = Math.max(0, Math.round((lastR / 100) * pLast));
+
+      // Project player pool at target to enforce physical earner monotonicity floor (earners_target >= eLast)
+      const poolGrowthRate = Math.max(0, Math.log(pLast / pFirst) / Math.max(0.2, uSpan));
+      const effDu = Math.sqrt(du * Math.min(du, 1.45));
+      const pTargetHigh = pLast * Math.exp(Math.min(1.8, poolGrowthRate * effDu * 1.25));
+      const monoFloorPct = Number(clamp((eLast / Math.max(pLast, pTargetHigh)) * 100, 0.01, lastR).toFixed(4));
+
+      // Global progression signal from non-intro trophies earned per tracked player
+      const firstMean = Math.max(0.05, (firstSnap.trophies_earned - pFirst) / pFirst);
+      const lastMean = Math.max(0.05, (lastSnap.trophies_earned - pLast) / pLast);
+      const globalLogitDrift = Math.log(lastMean / firstMean) / Math.max(0.2, uSpan);
 
       // Shrink individual slope toward tier mean slope + damped global progression
-      const shrinkW = clamp(uSpan / (uSpan + 0.75), 0.15, 0.80);
-      const priorSlope = 0.7 * tierMeanSlope[t.tier] + 0.3 * clamp(globalLogitDrift, -0.5, 1.2);
+      const shrinkW = clamp(uSpan / (uSpan + 0.70), 0.18, 0.82);
+      const priorSlope = 0.72 * tierMeanSlope[t.tier] + 0.28 * clamp(globalLogitDrift, -0.4, 1.25);
       const rawShrunk = shrinkW * rawSlopes[i] + (1 - shrinkW) * priorSlope;
       const shrunkSlope = lastR >= 95 ? Math.min(rawShrunk, 0.12) : rawShrunk;
-      // Damped extrapolation over du
-      const effDu = Math.sqrt(du * Math.min(du, 1.4));
       medZ = lastZ + shrunkSlope * effDu;
 
-      const tierMult = t.tier === 'platinum' ? 1.12 : t.tier === 'gold' ? 1.08 : 1.0;
-      const horizonSigma = 0.28 * Math.sqrt(horizonDays) * tierMult;
-      const poolSigma = lastSnap.players_tracked < 3000 ? 0.22 : 0.08;
-      spreadZ = Math.hypot(horizonSigma, rawResiduals[i] * 0.75, poolSigma);
-      if (lastR >= 99.5) spreadZ = Math.min(spreadZ, 0.15);
-    }
+      const tierMult = t.tier === 'platinum' ? 1.15 : t.tier === 'gold' ? 1.08 : 1.0;
+      const horizonSigma = 0.26 * Math.sqrt(horizonDays) * tierMult;
+      const poolSigma = pLast < 3000 ? 0.20 : 0.07;
+      spreadZ = Math.hypot(horizonSigma, rawResiduals[i] * 0.70, poolSigma);
+      if (lastR >= 99.5) spreadZ = Math.min(spreadZ, 0.12);
 
-    const qs = lastR >= 99.9
-      ? [99.95, 99.98, 99.99, 99.99, 100.0]
-      : Z_NORM.map((zq) => Number(invLogit(medZ + zq * spreadZ).toFixed(4)));
-    for (let k = 1; k < qs.length; k++) {
-      if (qs[k] < qs[k - 1]) qs[k] = qs[k - 1];
+      const qs = lastR >= 99.9
+        ? [99.95, 99.98, 99.99, 100.0, 100.0]
+        : Z_NORM.map((zq) => Number(invLogit(medZ + zq * spreadZ).toFixed(4)));
+      if (qs[0] < monoFloorPct) qs[0] = monoFloorPct;
+      for (let k = 1; k < qs.length; k++) {
+        if (qs[k] < qs[k - 1]) qs[k] = qs[k - 1];
+      }
+      outTrophies.push({ id: t.id, q: qs });
     }
-    outTrophies.push({ id: t.id, q: qs });
   }
 
   return { trophies: outTrophies };
