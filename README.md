@@ -30,7 +30,7 @@ node validate.mjs /path/to/gta6-trophy-rarity-forecast-01-kit
 
 The validation harness checks output shape, bounds, monotonic quantiles, file size, exact determinism across two processes, duplicate-cache invariance, count intervals, and chronological cuts from supplied input history. It compares sensitivity on independent synthetic dilution, linear-growth, saturating-growth, and delayed-progression paths against the two published house baseline formulas using the exact clipped-logit pinball metric.
 
-The practice kit contains **no target labels or local official scorer**. Its history cuts contain only an unchanged cache. Synthetic comparisons are assumption tests, not evidence of predictive accuracy. There is also too little pre-deadline history to backtest a 108.5-hour horizon. Exact public top-entry scores beyond three significant figures and the three house-entry scores were unavailable in the board inspected during development. No competitor repositories or source were read.
+The practice kit contains **no target labels or local official scorer**. Its history cuts contain only an unchanged cache. Synthetic comparisons are assumption tests, not evidence of predictive accuracy. There is also too little pre-deadline history to backtest a 108.5-hour horizon. Exact top-20 scores were recovered from public archive score metadata; the top entry scored 0.000375 and the 20th scored 0.032516. No house-entry rows were present in the board inspected during development, so their exact scores remain unavailable. No competitor repositories or source were read.
 
 ---
 
