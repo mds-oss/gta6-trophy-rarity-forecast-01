@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { forecast, countBounds, logit } from './main.ts';
 
@@ -9,7 +10,8 @@ const levels = [0.05, 0.25, 0.5, 0.75, 0.95];
 const z = [-1.644854, -0.67449, 0, 0.67449, 1.644854];
 const clip = value => Math.max(0.01, Math.min(99.99, value));
 const inverse = value => 100 / (1 + Math.exp(-value));
-const kit = resolve(process.argv[2] || '../gta6-trophy-rarity-forecast-01-kit');
+const root = dirname(fileURLToPath(import.meta.url));
+const kit = process.argv[2] ? resolve(process.argv[2]) : resolve(root, '../gta6-trophy-rarity-forecast-01-kit');
 const fixture = JSON.parse(readFileSync(join(kit, 'input/p00.in'), 'utf8'));
 const loss = (result, rates) => result.trophies.reduce((sum, row, i) => sum + row.q.reduce((a, q, k) => {
   const error = logit(rates[i]) - logit(q);
@@ -110,7 +112,7 @@ for (const id of ['p00','p01']) {
   assert.deepEqual(result,forecast(data));
   practice.push({id,bytes:Buffer.byteLength(JSON.stringify(result)),official_loss:null});
 }
-const folder = resolve('../validation');
+const folder = resolve(root, '../validation');
 mkdirSync(folder,{recursive:true});
 const runtimes = [];
 const hashes = [];
@@ -118,7 +120,7 @@ for (let repeat=0;repeat<2;repeat++) {
   const output = join(folder,`run-${repeat+1}`);
   mkdirSync(output,{recursive:true});
   const start=performance.now();
-  const processResult=spawnSync(process.execPath,['main.ts'],{cwd:resolve('.'),env:{...process.env,MAKEFUN_INPUT_DIR:join(kit,'input'),MAKEFUN_OUTPUT_DIR:output},encoding:'utf8'});
+  const processResult=spawnSync(process.execPath,['main.ts'],{cwd:root,env:{...process.env,MAKEFUN_INPUT_DIR:join(kit,'input'),MAKEFUN_OUTPUT_DIR:output},encoding:'utf8'});
   assert.equal(processResult.status,0,processResult.stderr);
   runtimes.push(performance.now()-start);
   hashes.push(['p00','p01'].map(id=>readFileSync(join(output,`${id}.out`),'utf8')));
